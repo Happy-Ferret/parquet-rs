@@ -17,6 +17,7 @@
 
 use std::mem::{size_of, transmute_copy};
 use std::cmp;
+use util::bit_packing::unpack32;
 
 use errors::{Result, ParquetError};
 use util::memory::ByteBufferPtr;
@@ -425,10 +426,7 @@ impl BitReader {
       self.byte_offset += 8;
       self.bit_offset -= 64;
 
-      let bytes_to_read = cmp::min(self.total_bytes - self.byte_offset, 8);
-      self.buffered_values = read_num_bytes!(
-        u64, bytes_to_read, self.buffer.start_from(self.byte_offset).as_ref());
-
+      self.reload_buffer_values();
       v |= trailing_bits(self.buffered_values, self.bit_offset)
         .wrapping_shl((num_bits - self.bit_offset) as u32);
     }
@@ -438,6 +436,64 @@ impl BitReader {
       transmute_copy::<u64, T>(&v)
     };
     Some(result)
+  }
+
+  #[inline]
+  pub fn get_batch<T: Default>(&mut self, batch: &mut [T], num_bits: usize) -> usize {
+    assert!(num_bits <= 32);
+    assert!(num_bits <= size_of::<T>() * 8);
+
+    let mut values_to_read = batch.len();
+    let needed_bits = num_bits * values_to_read;
+    let remaining_bits = (self.total_bytes - self.byte_offset) * 8 - self.bit_offset;
+    if remaining_bits < needed_bits {
+      values_to_read = remaining_bits / num_bits;
+    }
+
+    let mut i = 0;
+
+    // First align bit offset to byte offset
+    if self.bit_offset != 0 {
+      while i < values_to_read && self.bit_offset != 0 {
+        batch[i] = self.get_value(num_bits).expect("expected to have more data");
+        i += 1;
+      }
+    }
+
+    unsafe {
+      let in_buf = &self.buffer.data()[self.byte_offset..];
+      let mut in_ptr = in_buf as *const [u8] as *const u8 as *const u32;
+      if size_of::<T>() == 4 {
+        // Now decode in a smaller batch size of 32, using scalar unpacker
+        while values_to_read - i >= 32 {
+          let out_ptr = &mut batch[i..] as *mut [T] as *mut T as *mut u32;
+          in_ptr = unpack32(in_ptr, out_ptr, num_bits);
+          self.byte_offset += 4 * num_bits;
+          i += 32;
+        }
+      } else {
+        let mut out_buf = [0u32; 32];
+        let out_ptr = &mut out_buf as &mut [u32] as *mut [u32] as *mut u32;
+        while values_to_read - i >= 32 {
+          in_ptr = unpack32(in_ptr, out_ptr, num_bits);
+          self.byte_offset += 4 * num_bits;
+          for j in 0..32 {
+            batch[i] = transmute_copy::<u32, T>(&out_buf[j]);
+            i += 1;
+          }
+        }
+      }
+    }
+
+    assert!(values_to_read - i < 32);
+
+    self.reload_buffer_values();
+    while i < values_to_read {
+      batch[i] = self.get_value(num_bits).expect("expected to have more data");
+      i += 1;
+    }
+
+    values_to_read
   }
 
   /// Reads a `num_bytes`-sized value from this buffer and return it.
@@ -464,9 +520,7 @@ impl BitReader {
 
     // Reset buffered_values
     self.bit_offset = 0;
-    let bytes_remaining = cmp::min(self.total_bytes - self.byte_offset, 8);
-    self.buffered_values = read_num_bytes!(
-      u64, bytes_remaining, self.buffer.start_from(self.byte_offset).as_ref());
+    self.reload_buffer_values();
     Some(v)
   }
 
@@ -505,6 +559,13 @@ impl BitReader {
       let u = v as u64;
       ((u >> 1) as i64 ^ -((u & 1) as i64))
     })
+  }
+
+  #[inline]
+  fn reload_buffer_values(&mut self) {
+    let bytes_to_read = cmp::min(self.total_bytes - self.byte_offset, 8);
+    self.buffered_values = read_num_bytes!(
+      u64, bytes_to_read, self.buffer.start_from(self.byte_offset).as_ref());
   }
 }
 
@@ -769,6 +830,60 @@ mod tests {
     for i in 0..total {
       let v = reader.get_value::<u64>(num_bits).expect("get_value() should return OK");
       assert_eq!(v, values[i], "[{}]: expected {} but got {}", i, values[i], v);
+    }
+  }
+
+  #[test]
+  fn test_get_batch() {
+    const SIZE: &[usize] = &[1, 31, 32, 33, 128, 129];
+    for s in SIZE {
+      for i in 0..33 {
+        match i {
+          0 ... 8  => test_get_batch_rand::<u8>(*s, i),
+          9 ... 16 => test_get_batch_rand::<u16>(*s, i),
+          17 ... 32 => test_get_batch_rand::<u32>(*s, i),
+          _ => unimplemented!()
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn test_get_batch_test() {
+    test_get_batch_rand::<u8>(33, 1);
+  }
+
+  fn test_get_batch_rand<T>(
+    total: usize, num_bits: usize
+  ) where T: Default + Clone + Debug + Eq {
+    assert!(num_bits <= 32);
+    let num_bytes = ceil(num_bits as i64, 8);
+    let mut writer = BitWriter::new(num_bytes as usize * total);
+
+    let values: Vec<u32> = random_numbers::<u32>(total)
+      .iter()
+      .map(|v| v & (((1u64 << num_bits) - 1)) as u32)
+      .collect();
+
+    // Used to check against the values read from `get_batch`.
+    let generic_values: Vec<T> = values
+      .iter()
+      .map(|v| unsafe {
+        transmute_copy::<u32, T>(&v)
+      })
+      .collect();
+
+    for i in 0..total {
+      assert!(writer.put_value(values[i] as u64, num_bits));
+    }
+
+    let buf = writer.consume();
+    let mut reader = BitReader::from(buf);
+    let mut batch = vec![T::default(); values.len()];
+    let values_read = reader.get_batch::<T>(&mut batch, num_bits);
+    assert_eq!(values_read, values.len());
+    for i in 0..batch.len() {
+      assert_eq!(batch[i], generic_values[i], "num_bits = {}, index = {}", num_bits, i);
     }
   }
 
